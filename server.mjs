@@ -17,13 +17,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { runMcpStdioServer, textResult } from '../shared/mcp-stdio.mjs';
+import { runMcpStdioServer, textResult } from './shared/mcp-stdio.mjs';
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
   truncateTail,
-} from '../shared/truncate.mjs';
+} from './shared/truncate.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
