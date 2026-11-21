@@ -1,22 +1,24 @@
 #!/usr/bin/env bun
 /**
- * MCP server: local terminal — just-bash CLI for scripts + argv exec for host binaries.
+ * MCP server: local terminal — real host bash for scripts + argv exec for
+ * host binaries.
  *
- * just-bash is invoked as a subprocess (more reliable under Bun than in-process
- * DefenseInDepthBox patches). Uses OverlayFs semantics: --root mounts project.
+ * No sandbox, no emulation: `bash` spawns the real `bash` on this machine
+ * and `exec` spawns the program directly (no shell). Both run as the MCP
+ * server's user against the real host filesystem.
  *
  * Env:
- *   MCP_TERM_CWD / MCP_TERM_JB_ROOT — sandbox root (default cwd)
- *   MCP_TERM_ALLOW — comma regex allowlist (optional)
- *   JUST_BASH_BIN — path to just-bash binary
+ *   MCP_TERM_CWD / MCP_TERM_JB_ROOT — default working directory for `bash`
+ *     (CWD wins; JB_ROOT is a legacy alias kept so existing configs still
+ *     resolve a root)
+ *   MCP_TERM_PATH / MCP_TERM_ENV — extra environment, prepended over the host env
+ *   MCP_TERM_ALLOW — comma-separated regexes (optional); the command line
+ *     must match one of the patterns to run
  */
 import { spawn } from 'node:child_process';
-import { resolve, dirname, join } from 'node:path';
-import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { runMcpStdioServer, textResult } from './shared/mcp-stdio.mjs';
 import {
   DEFAULT_MAX_BYTES,
@@ -25,21 +27,15 @@ import {
   truncateTail,
 } from './shared/truncate.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
-
 const DEFAULT_CWD = process.env.MCP_TERM_CWD
   ? resolve(process.env.MCP_TERM_CWD)
+  : process.env.MCP_TERM_JB_ROOT
+  ? resolve(process.env.MCP_TERM_JB_ROOT)
   : process.cwd();
 
-const JB_ROOT = process.env.MCP_TERM_JB_ROOT
-  ? resolve(process.env.MCP_TERM_JB_ROOT)
-  : DEFAULT_CWD;
-
 /**
- * Sandbox env for just-bash / host exec (from agent coffee via MCP_TERM_PATH /
- * MCP_TERM_ENV). Prepended to scripts as `export KEY=…` because just-bash has
- * no --env flag.
+ * Extra env for bash / host exec (from agent coffee via MCP_TERM_PATH /
+ * MCP_TERM_ENV), layered over the host environment.
  */
 function parseTermEnv() {
   const out = {};
@@ -70,6 +66,9 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+/** Prepends `export KEY=…` lines so the script's own `bash` sees them —
+ * still harmless on a real bash (a double export wins) and needed nowhere
+ * else; kept so scripts can rely on TERM_ENV vars. */
 function withEnvExports(script) {
   const keys = Object.keys(TERM_ENV);
   if (!keys.length) return script;
@@ -79,7 +78,7 @@ function withEnvExports(script) {
   return `${preamble}; ${script}`;
 }
 
-/** Active host exec children for Stop */
+/** Active children for Stop */
 const activeChildren = new Set();
 
 export function abortAllTermLocal() {
@@ -95,24 +94,6 @@ export function abortAllTermLocal() {
   activeChildren.clear();
   return n;
 }
-
-function findJustBash() {
-  if (process.env.JUST_BASH_BIN && existsSync(process.env.JUST_BASH_BIN)) {
-    return process.env.JUST_BASH_BIN;
-  }
-  try {
-    const pkg = dirname(require.resolve('just-bash/package.json'));
-    const bin = join(pkg, 'dist/bin/just-bash.js');
-    if (existsSync(bin)) return bin;
-  } catch {
-    /* ignore */
-  }
-  const local = join(__dirname, '../node_modules/just-bash/dist/bin/just-bash.js');
-  if (existsSync(local)) return local;
-  return 'just-bash';
-}
-
-const JUST_BASH = findJustBash();
 
 const allowRaw = process.env.MCP_TERM_ALLOW || '';
 const allowRules = allowRaw
@@ -327,24 +308,20 @@ function finishShellResult(formatted, raw) {
   return textResult(text || '(no output)');
 }
 
-async function runJustBash(script, { cwd, timeoutSec, onChunk, signal } = {}) {
+/**
+ * Real `bash -c <script>` on the host. The script runs in the MCP server's
+ * user environment: full filesystem, real tools, real PATH (augmented by
+ * TERM_ENV).
+ */
+async function runBash(script, { cwd, timeoutSec, onChunk, signal } = {}) {
   checkAllow(script);
   const body = withEnvExports(String(script));
-  const args = ['-c', body, '--root', JB_ROOT];
-  if (cwd) args.push('--cwd', cwd);
+  const workdir = cwd ? resolve(cwd) : DEFAULT_CWD;
+  const env = { ...process.env, ...TERM_ENV };
 
-  let runner;
-  let runnerArgs;
-  if (JUST_BASH.endsWith('.js')) {
-    runner = process.env.JUST_BASH_NODE || 'node';
-    runnerArgs = [JUST_BASH, ...args];
-  } else {
-    runner = JUST_BASH;
-    runnerArgs = args;
-  }
-
-  return runProcess(runner, runnerArgs, {
-    cwd: JB_ROOT,
+  return runProcess('bash', ['-c', body], {
+    cwd: workdir,
+    env,
     track: true,
     timeoutSec,
     onChunk,
@@ -355,15 +332,16 @@ async function runJustBash(script, { cwd, timeoutSec, onChunk, signal } = {}) {
 const tools = {
   bash: {
     description:
-      `Run a shell script via just-bash (emulated bash: pipes, redirects, builtins). ` +
-      `Sandbox root is MCP_TERM_JB_ROOT / MCP_TERM_CWD (OverlayFs: reads real files, writes ephemeral). ` +
+      `Run a real bash script on the host (full shell: pipes, redirects, builtins). ` +
+      `Runs with the MCP server's user and the host filesystem, in MCP_TERM_CWD ` +
+      `("${DEFAULT_CWD}") or the requested cwd. No sandbox, no write restrictions. ` +
       `Stdout and stderr are merged. Non-zero exit throws. Output is truncated to last ${DEFAULT_MAX_LINES} lines ` +
-      `or ${DEFAULT_MAX_BYTES / 1024}KB. For host processes outside the sandbox, use exec.`,
+      `or ${DEFAULT_MAX_BYTES / 1024}KB. For a plain program with argv (no shell), use exec.`,
     inputSchema: {
       type: 'object',
       properties: {
         script: { type: 'string', description: 'Bash script' },
-        cwd: { type: 'string', description: 'Optional cwd inside sandbox' },
+        cwd: { type: 'string', description: 'Optional working directory on the host' },
         timeout: { type: 'number', description: 'Timeout in seconds (optional)' },
       },
       required: ['script'],
@@ -371,21 +349,24 @@ const tools = {
     async handler({ script, cwd, timeout }, ctx) {
       if (!script || !String(script).trim()) throw new Error('script required');
       const progress = createProgressEmitter(ctx);
-      const raw = await runJustBash(String(script), {
+      const raw = await runBash(String(script), {
         cwd,
         timeoutSec: timeout,
         onChunk: (_chunk, merged) => progress.push(merged),
         signal: ctx?.signal,
       });
       progress.flush();
-      const formatted = await formatShellOutput(raw.merged, { jailRoot: JB_ROOT });
+      const workdir = cwd ? resolve(cwd) : DEFAULT_CWD;
+      const formatted = await formatShellOutput(raw.merged, { jailRoot: workdir });
       return finishShellResult(formatted, raw);
     },
   },
 
   exec: {
     description:
-      `Run a local host program with argv (no shell). Real process on this machine. ` +
+      `Run a host program with argv (no shell). ` +
+      `command is the program path or name (found via PATH), args is its argument list; ` +
+      `to run a shell pipeline use bash. Real process on this machine. ` +
       `Stdout and stderr are merged. Non-zero exit throws. Output is truncated to last ${DEFAULT_MAX_LINES} lines ` +
       `or ${DEFAULT_MAX_BYTES / 1024}KB.`,
     inputSchema: {
@@ -422,9 +403,10 @@ const tools = {
 };
 
 process.stderr.write(
-  `term-local: just-bash=${JUST_BASH} root=${JB_ROOT}` +
+  `term-local: bash(root=${DEFAULT_CWD}) exec(host, no shell)` +
     (TERM_ENV.PATH ? ` path=${TERM_ENV.PATH.split(':').length}dirs` : '') +
+    (process.env.MCP_TERM_ALLOW ? ' allowlist active' : '') +
     `\n`,
 );
 
-await runMcpStdioServer({ name: 'term-local', version: '0.2.0', tools });
+await runMcpStdioServer({ name: 'term-local', version: '0.2.1', tools });
